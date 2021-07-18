@@ -27,9 +27,9 @@ cd dwm
 curl https://dwm.suckless.org/patches/centeredmaster/dwm-centeredmaster-6.1.diff | git apply -
 make clean install
 
-# cd /tmp
-# git clone --single-branch --depth=1  https://git.suckless.org/dmenu
-# cd dmenu && make clean install
+cd /tmp
+git clone --single-branch --depth=1  https://git.suckless.org/dmenu
+cd dmenu && make clean install
 
 cd /tmp
 git clone --single-branch --depth=1  https://git.suckless.org/st
