@@ -75,7 +75,7 @@ if [ $KERNEL_FLAVOR = "virt" ]; then
         iface lo inet loopback
         auto  eth0
         iface eth0 inet dhcp
-    EOF
+EOF
     ln -s networking /etc/init.d/net.eth0
     rc-update add net.eth0 default
 else
