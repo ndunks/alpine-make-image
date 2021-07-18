@@ -49,6 +49,8 @@
 #
 #   -C --no-cleanup (CLEANUP)             Don't umount and disconnect image when done.
 #
+#   -N --no-cleanup-temp                  No cleanup temp (keep apk-tools)
+#
 #   -p --packages PACKAGES                Additional packages to install into the image.
 #
 #   -r --repositories-file REPOS_FILE     Path of repositories file to copy into the rootfs.
@@ -130,9 +132,11 @@ help() {
 cleanup() {
 	set +eu
 	trap '' EXIT HUP INT TERM  # unset trap to avoid loop
+	einfo "Cleanup.."
 
 	cd /
-	if [ -d "$temp_dir" ]; then
+	if [ "$CLEANUP" = "yes" ] && [ -d "$temp_dir" ]; then
+		einfo "Cleaning $temp_dir"
 		rm -Rf "$temp_dir"
 	fi
 	if [ "$mount_dir" ]; then
@@ -160,7 +164,7 @@ attach_image() {
 	local nbd_dev
 
 	nbd_dev=$(get_available_nbd) || {
-		modprobe nbd max_part=0
+		modprobe nbd max_part=2
 		sleep 1
 		nbd_dev=$(get_available_nbd)
 	} || die 'No available nbd device found!'
@@ -173,7 +177,7 @@ attach_image() {
 # Prints UUID of filesystem on the specified block device.
 blk_uuid() {
 	local dev="$1"
-	blkid "$dev" | sed -En 's/.*UUID="([^"]+)".*/\1/p'
+	blkid "$dev" | sed -En 's/.* UUID="([^"]+)".*/\1/p'
 }
 
 # Writes Alpine APK keys embedded in this script into directory $1.
@@ -193,7 +197,7 @@ dump_alpine_keys() {
 
 # Prints path of available nbdX device, or returns 1 if not any.
 get_available_nbd() {
-	local dev; for dev in $(find /dev -maxdepth 2 -name 'nbd[0-9]*'); do
+	local dev; for dev in $(find /dev -maxdepth 2 -name 'nbd[0-9]'); do
 		if [ "$(blockdev --getsize64 "$dev")" -eq 0 ]; then
 			echo "$dev"; return 0
 		fi
@@ -262,6 +266,11 @@ setup_extlinux() {
 			|| default_kernel='vanilla'
 	fi
 
+	# My dev server has no CMOS battery, need to disable efi to be able to boot
+	if [ ${kernel_flavor##*-} = 'lts' ]; then
+		kernel_opts="$kernel_opts noefi"
+	fi
+
 	sed -Ei \
 		-e "s|^[# ]*(root)=.*|\1=$root_dev|" \
 		-e "s|^[# ]*(default_kernel_opts)=.*|\1=\"$kernel_opts\"|" \
@@ -269,10 +278,29 @@ setup_extlinux() {
 		-e "s|^[# ]*(default)=.*|\1=$default_kernel|" \
 		-e "s|^[# ]*(serial_port)=.*|\1=$serial_port|" \
 		"$mnt"/etc/update-extlinux.conf
-
 	chroot "$mnt" extlinux --install /boot
-	chroot "$mnt" update-extlinux --warn-only 2>&1 \
-		| grep -Fv 'extlinux: cannot open device /dev' >&2
+	einfo "update-extlinux $nbd_dev"
+	chroot "$mnt" update-extlinux --warn-only || "update-extlinux FAIL"
+
+	einfo "Installing EFI Boot"
+	dd bs=440 count=1 conv=notrunc if=usr/share/syslinux/gptmbr.bin of=$nbd_dev
+	mkdir -p boot/EFI/BOOT
+	# mkdir -p boot/syslinux
+
+	cp usr/share/syslinux/efi64/syslinux.efi boot/EFI/BOOT/BOOTX64.EFI
+	# cp usr/share/syslinux/ldlinux.c32 boot/syslinux
+	# cp usr/share/syslinux/libcom32.c32 boot/syslinux
+	# cp usr/share/syslinux/libutil.c32 boot/syslinux
+	# cp usr/share/syslinux/mboot.c32 boot/syslinux
+	# cp usr/share/syslinux/menu.c32 boot/syslinux
+	# cp usr/share/syslinux/vesamenu.c32 boot/syslinux
+	cp -r usr/share/syslinux/efi64 boot/syslinux
+	
+	sed -i -e 's/LINUX /LINUX \//' -e 's/INITRD /INITRD \//' boot/extlinux.conf
+	cp boot/extlinux.conf boot/syslinux/syslinux.cfg
+	# Make absolute path
+	# cp boot/vmlinuz* boot/
+	# cp boot/initramfs* boot/
 }
 
 # Configures mkinitfs.
@@ -312,8 +340,8 @@ wgets() (
 
 #=============================  M a i n  ==============================#
 
-opts=$(getopt -n $PROGNAME -o b:cCf:hi:k:p:r:s:tv \
-	-l branch:,image-format:,image-size:,initfs-features:,kernel-flavor:,keys-dir:,mirror-uri:,no-cleanup,packages:,repositories-file:,rootfs:,script-chroot,serial-console,help,version \
+opts=$(getopt -n $PROGNAME -o b:cm:CNf:hi:k:p:r:s:tv \
+	-l branch:,image-format:,image-size:,initfs-features:,kernel-flavor:,keys-dir:,mirror-uri:,no-cleanup,no-cleanup-temp,packages:,repositories-file:,rootfs:,script-chroot,serial-console,help,version \
 	-- "$@") || help 1 >&2
 
 eval set -- "$opts"
@@ -328,6 +356,7 @@ while [ $# -gt 0 ]; do
 		     --keys-dir) KEYS_DIR="$(realpath "$2")";;
 		-m | --mirror-uri) ALPINE_MIRROR="$2";;
 		-C | --no-cleanup) CLEANUP='no'; n=1;;
+		-N | --no-cleanup-temp) CLEANUP='no-temp'; n=1;;
 		-p | --packages) PACKAGES="${PACKAGES:-} $2";;
 		-r | --repositories-file) REPOS_FILE="$(realpath "$2")";;
 		     --rootfs) ROOTFS="$2";;
@@ -341,7 +370,12 @@ while [ $# -gt 0 ]; do
 done
 
 : ${ALPINE_BRANCH:="latest-stable"}
-: ${ALPINE_MIRROR:="http://dl-cdn.alpinelinux.org/alpine"}
+if pidof apt-cacher-ng; then
+	ALPINE_MIRROR="http://localhost:3142/mirror.xtom.com.hk/alpine"
+	einfo "Using proxied repo"
+else
+	: ${ALPINE_MIRROR:="http://dl-cdn.alpinelinux.org/alpine"}
+fi
 : ${CLEANUP:="yes"}
 : ${IMAGE_FORMAT:=}
 : ${IMAGE_SIZE:="2G"}
@@ -390,18 +424,25 @@ fi
 #-----------------------------------------------------------------------
 temp_dir=''
 if ! command -v "$APK" >/dev/null; then
-	einfo "$APK not found, downloading static apk-tools"
+	temp_dir="$PWD/tmp"
+	[ -d $temp_dir ] || mkdir -m 777 $temp_dir
+	if [ -z "$(ls $temp_dir/apk-tools-*/apk 2>/dev/null)" ]; then
+		einfo "$APK not found, downloading static apk-tools"
 
-	temp_dir="$(mktemp -d /tmp/$PROGNAME.XXXXXX)"
-	wgets "$APK_TOOLS_URI" "$APK_TOOLS_SHA256" "$temp_dir"
-	tar -C "$temp_dir" -xzf "$temp_dir/${APK_TOOLS_URI##*/}"
-	APK="$(ls "$temp_dir"/apk-tools-*/apk)"
+		wgets "$APK_TOOLS_URI" "$APK_TOOLS_SHA256" "$temp_dir"
+		tar -C "$temp_dir" -xzf "$temp_dir/${APK_TOOLS_URI##*/}"
+	else
+		einfo "Using previous static apk-tools on "$temp_dir/apk-tools-*
+	fi
+	APK="$(ls $temp_dir/apk-tools-*/apk)"
+	$APK -V
 fi
 
 #-----------------------------------------------------------------------
 if [ ! -f "$IMAGE_FILE" ]; then
 	einfo "Creating $IMAGE_FORMAT image of size $IMAGE_SIZE"
 	qemu-img create ${IMAGE_FORMAT:+-f $IMAGE_FORMAT} "$IMAGE_FILE" "$IMAGE_SIZE"
+	chmod 777 $IMAGE_FILE
 fi
 
 #-----------------------------------------------------------------------
@@ -410,22 +451,35 @@ einfo "Attaching image $IMAGE_FILE as a NBD device"
 nbd_dev=$(attach_image "$IMAGE_FILE" "$IMAGE_FORMAT")
 
 #-----------------------------------------------------------------------
-einfo "Formatting image to $ROOTFS"
+einfo "Partitioning image $nbd_dev"
+parted $nbd_dev -s -- mklabel gpt
+#parted $nbd_dev -s -- mklabel msdos
+parted $nbd_dev -s -- mkpart primary fat32 2048s 80MiB
+parted $nbd_dev -s -- mkpart primary ext4 80MiB -2048s
+parted $nbd_dev -s -- set 1 esp on
+parted $nbd_dev -s -- set 1 legacy_boot on
 
 # syslinux 6.0.3 cannot boot from ext4 w/ 64bit feature enabled.
 # -E nodiscard / -K - do not attempt to discard blocks at mkfs time (it's
 # useless for NBD image and prints confusing error).
 [ "$ROOTFS" = ext4 ] && mkfs_args='-O ^64bit -E nodiscard' || mkfs_args='-K'
 
-mkfs.$ROOTFS -L root $mkfs_args "$nbd_dev"
+einfo "Formating rootfs to $ROOTFS"
+mkfs.fat "${nbd_dev}p1"
+mkfs.$ROOTFS -F -L root $mkfs_args "${nbd_dev}p2"
 
-root_uuid=$(blk_uuid "$nbd_dev")
+root_uuid=$(blk_uuid "${nbd_dev}p2")
+efi_uuid=$(blk_uuid "${nbd_dev}p1")
 mount_dir=$(mktemp -d /tmp/$PROGNAME.XXXXXX)
 
 #-----------------------------------------------------------------------
 einfo "Mounting image at $mount_dir"
 
-mount "$nbd_dev" "$mount_dir"
+mount "${nbd_dev}p2" "$mount_dir"
+mkdir -p $mount_dir/boot
+mount "${nbd_dev}p1" "$mount_dir/boot"
+#mkdir $mount_dir/efi/boot
+#ln -f -s /efi/boot "$mount_dir/boot"
 
 #-----------------------------------------------------------------------
 einfo 'Installing base system'
@@ -447,11 +501,6 @@ else
 	dump_alpine_keys etc/apk/keys/
 fi
 
-# Use APK cache if available.
-if [ -L /etc/apk/cache ]; then
-	ln -s "$(realpath /etc/apk/cache)" etc/apk/cache
-fi
-
 _apk add --root . --update-cache --initdb alpine-base
 prepare_chroot .
 
@@ -464,18 +513,19 @@ setup_mkinitfs . "base $ROOTFS $INITFS_FEATURES"
 #-----------------------------------------------------------------------
 einfo "Installing kernel linux-$KERNEL_FLAVOR"
 
-_apk add --root . linux-$KERNEL_FLAVOR
+_apk add --root . --virtual kernel linux-$KERNEL_FLAVOR linux-firmware-none
 
 #-----------------------------------------------------------------------
 einfo 'Setting up extlinux bootloader'
-
 _apk add --root . --no-scripts syslinux
-setup_extlinux . "UUID=$root_uuid" "$ROOTFS" "$KERNEL_FLAVOR" "$SERIAL_PORT"
 
 cat > etc/fstab <<-EOF
 	# <fs>		<mountpoint>	<type>	<opts>		<dump/pass>
-	UUID=$root_uuid	/		$ROOTFS	noatime		0 1
+	UUID=$root_uuid	/		  $ROOTFS	noatime		0 1
+	UUID=$efi_uuid	/boot vfat 	noatime		0 1
 EOF
+
+setup_extlinux . "UUID=$root_uuid" "$ROOTFS" "$KERNEL_FLAVOR" "$SERIAL_PORT"
 
 #-----------------------------------------------------------------------
 if [ "$SERIAL_PORT" ]; then
@@ -499,11 +549,6 @@ if [ "$PACKAGES" ]; then
 fi
 
 #-----------------------------------------------------------------------
-if [ -L /etc/apk/cache ]; then
-	rm etc/apk/cache >/dev/null 2>&1
-fi
-
-#-----------------------------------------------------------------------
 if [ "$SCRIPT" ]; then
 	script_name="${SCRIPT##*/}"
 
@@ -513,7 +558,7 @@ if [ "$SCRIPT" ]; then
 	else
 		einfo "Executing script in chroot: $script_name $*"
 		mount_bind "${SCRIPT%/*}" mnt/
-		chroot . /bin/sh -c "cd /mnt && ./$script_name \"\$@\"" -- "$@" \
+		chroot . /bin/sh -c "cd /mnt && ./$script_name $KERNEL_FLAVOR $nbd_dev \"\$@\"" -- "$@" \
 			|| die 'Script failed'
 	fi
 fi
